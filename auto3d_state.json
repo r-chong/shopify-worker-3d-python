@@ -1,0 +1,7 @@
+{
+  "gid://shopify/Product/10090693427384": {
+    "last_fp": "37abfaed6891df87",
+    "status": "failed",
+    "error": "[{'message': \"InputObject 'ProductInput' doesn't accept argument 'media'\", 'locations': [{'line': 3, 'column': 44}], 'path': ['mutation', 'productUpdate', 'input', 'media'], 'extensions': {'code': 'argumentNotAccepted', 'name': 'ProductInput', 'typeName': 'InputObject', 'argumentName': 'media'}}, {'message': 'Variable $media is declared by anonymous mutation but not used', 'locations': [{'line': 2, 'column': 5}], 'path': ['mutation'], 'extensions': {'code': 'variableNotUsed', 'variableName': 'media'}}]"
+  }
+}

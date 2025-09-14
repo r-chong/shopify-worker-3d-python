@@ -106,14 +106,25 @@ def meshy_generate_glb(image_url):
         json={"image_url": image_url, "enable_texture": True}
     )
     r.raise_for_status()
-    task_id = r.json()["task_id"]
+    resp = r.json()
+    print('meshy resp',resp)
+    if "task_id" in resp:
+        task_id = resp["task_id"]
+    elif "result" in resp:
+        task_id = resp["result"]
+    else:
+        print("Meshy API error response:", resp)
+        raise RuntimeError(f"Meshy API did not return a valid task id. Response: {resp}")
     # 2) poll
     while True:
         t = requests.get(
-            f"https://api.meshy.ai/openapi/v1/tasks/{task_id}",
+            f"https://api.meshy.ai/openapi/v1/image-to-3d/{task_id}",
             headers={"Authorization": f"Bearer {MESHY}"}
         ).json()
+        print("Meshy polling response:", t)
         status = t.get("status")
+        progress = t.get("progress")
+        print(f"Meshy task status: {status} | Progress: {progress}")
         if status == "SUCCEEDED":
             url = t.get("model_url") or next((a["url"] for a in t.get("assets", []) if a.get("format") == "glb"), None)
             if not url: raise RuntimeError("No GLB URL from generator")
@@ -142,18 +153,27 @@ def process_product(p):
     except Exception:
         pass
 
-    glb = meshy_generate_glb(img["url"])
-    res_url = staged_upload_glb("auto3d.glb", glb)
-    attach_model_media(pid, res_url)
-
-    state[pid] = {"last_fp": fp, "status": "ready"}
-    save_state()
     try:
-        set_meta(pid, "status", "single_line_text_field", "ready")
-    except Exception:
-        pass
-    print(f"✅ Attached MODEL_3D: {p['title']}")
-    return True
+        glb = meshy_generate_glb(img["url"])
+        res_url = staged_upload_glb("auto3d.glb", glb)
+        attach_model_media(pid, res_url)
+        state[pid] = {"last_fp": fp, "status": "ready"}
+        save_state()
+        try:
+            set_meta(pid, "status", "single_line_text_field", "ready")
+        except Exception:
+            pass
+        print(f"✅ Attached MODEL_3D: {p['title']}")
+        return True
+    except Exception as e:
+        print(f"❌ Error processing {p['title']}: {e}")
+        state[pid] = {"last_fp": fp, "status": "failed", "error": str(e)}
+        save_state()
+        try:
+            set_meta(pid, "status", "single_line_text_field", f"error:{str(e)[:120]}")
+        except Exception:
+            pass
+        return False
 
 if __name__ == "__main__":
     print("Local poller running. Ctrl+C to stop.")
