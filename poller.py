@@ -1,20 +1,60 @@
-import os, time, requests, json
+import os, time, json, hashlib, requests
+from pathlib import Path
 from dotenv import load_dotenv
 
 load_dotenv()
 SHOP = os.environ["SHOP"]
 TOKEN = os.environ["SHOPIFY_ADMIN_TOKEN"]
 MESHY = os.environ["MESHY_API_KEY"]
+GQL = f"https://{SHOP}/admin/api/2025-04/graphql.json"
+HEAD = {"X-Shopify-Access-Token": TOKEN, "Content-Type": "application/json"}
 
-GQL_URL = f"https://{SHOP}/admin/api/2025-04/graphql.json"
-HEADERS = {"X-Shopify-Access-Token": TOKEN, "Content-Type": "application/json"}
+STATE_PATH = Path("auto3d_state.json")
+state = json.loads(STATE_PATH.read_text()) if STATE_PATH.exists() else {}
+
+def save_state():
+    STATE_PATH.write_text(json.dumps(state, indent=2))
 
 def gql(query, variables=None):
-    r = requests.post(GQL_URL, headers=HEADERS, json={"query": query, "variables": variables or {}})
+    r = requests.post(GQL, headers=HEAD, json={"query": query, "variables": variables or {}})
     r.raise_for_status()
     j = r.json()
     if "errors" in j: raise RuntimeError(j["errors"])
     return j["data"]
+
+def list_recent_products(limit=15):
+        q = """
+        query($n:Int!){
+            products(first:$n, sortKey:UPDATED_AT, reverse:true){
+                edges{ node{
+                    id title updatedAt
+                    images(first:5){ edges{ node{ id url } } }
+                    media(first:10){ edges{ node{
+                        mediaContentType
+                    } } }
+                } }
+            }
+        }"""
+        d = gql(q, {"n": limit})
+        return [e["node"] for e in d["products"]["edges"]]
+
+def has_model3d(product):
+    for e in product.get("media", {}).get("edges", []):
+        if e["node"]["mediaContentType"] == "MODEL_3D":
+            return True
+    return False
+
+def latest_image(product):
+    imgs = [e["node"] for e in product.get("images", {}).get("edges", [])]
+    if not imgs:
+        return None
+    # Just use the first image since products are sorted by updatedAt
+    return imgs[0]
+
+def image_fingerprint(img):
+    # stable key: image id + url
+    base = f'{img["id"]}|{img["url"]}'
+    return hashlib.sha256(base.encode()).hexdigest()[:16]
 
 def set_meta(product_id, key, type_, value):
     m = """
@@ -34,14 +74,15 @@ def staged_upload_glb(filename, glb_bytes):
       }
     }"""
     d = gql(q, {"input": [{
-        "resource": "FILE", "filename": filename,
-        "mimeType": "model/gltf-binary", "httpMethod": "POST"
+        "resource": "FILE",
+        "filename": filename,
+        "mimeType": "model/gltf-binary",
+        "httpMethod": "POST"
     }]})
     t = d["stagedUploadsCreate"]["stagedTargets"][0]
-    files = {}
-    data = {p["name"]: p["value"] for p in t["parameters"]}
-    files["file"] = (filename, glb_bytes, "model/gltf-binary")
-    up = requests.post(t["url"], data=data, files=files)
+    form = {p["name"]: p["value"] for p in t["parameters"]}
+    files = {"file": (filename, glb_bytes, "model/gltf-binary")}
+    up = requests.post(t["url"], data=form, files=files)
     up.raise_for_status()
     return t["resourceUrl"]
 
@@ -52,67 +93,75 @@ def attach_model_media(product_id, resource_url):
         userErrors{ field message }
       }
     }"""
-    gql(m, {"productId": product_id,
-             "media": [{"originalSource": resource_url, "mediaContentType": "MODEL_3D"}]})
+    gql(m, {
+        "productId": product_id,
+        "media": [{"originalSource": resource_url, "mediaContentType": "MODEL_3D"}]
+    })
 
-def generate_glb_from_image(image_url):
+def meshy_generate_glb(image_url):
     # 1) create task
-    r = requests.post("https://api.meshy.ai/openapi/v1/image-to-3d",
-                      headers={"Authorization": f"Bearer {MESHY}", "Content-Type": "application/json"},
-                      json={"image_url": image_url, "enable_texture": True})
+    r = requests.post(
+        "https://api.meshy.ai/openapi/v1/image-to-3d",
+        headers={"Authorization": f"Bearer {MESHY}", "Content-Type": "application/json"},
+        json={"image_url": image_url, "enable_texture": True}
+    )
     r.raise_for_status()
     task_id = r.json()["task_id"]
     # 2) poll
     while True:
-        t = requests.get(f"https://api.meshy.ai/openapi/v1/tasks/{task_id}",
-                         headers={"Authorization": f"Bearer {MESHY}"}).json()
-        if t.get("status") == "SUCCEEDED":
-            url = t.get("model_url") or next((a["url"] for a in t.get("assets", []) if a.get("format")=="glb"), None)
+        t = requests.get(
+            f"https://api.meshy.ai/openapi/v1/tasks/{task_id}",
+            headers={"Authorization": f"Bearer {MESHY}"}
+        ).json()
+        status = t.get("status")
+        if status == "SUCCEEDED":
+            url = t.get("model_url") or next((a["url"] for a in t.get("assets", []) if a.get("format") == "glb"), None)
             if not url: raise RuntimeError("No GLB URL from generator")
-            glb = requests.get(url).content
-            return glb
-        if t.get("status") == "FAILED":
-            raise RuntimeError(t.get("error","Meshy failed"))
+            return requests.get(url).content
+        if status == "FAILED":
+            raise RuntimeError(t.get("error", "Meshy failed"))
         time.sleep(4)
 
-def work_once():
-    q = """
-    {
-      products(first:20, sortKey:UPDATED_AT, reverse:true){
-        edges{ node{
-          id title
-          metafields(first:10, namespace:"auto3d"){ edges{ node{ key value } } }
-        }}
-      }
-    }"""
-    data = gql(q)
-    for edge in data["products"]["edges"]:
-        p = edge["node"]
-        meta = {e["node"]["key"]: e["node"]["value"] for e in (p.get("metafields", {}).get("edges") or [])}
-        if meta.get("pending") != "1":
-            continue
-        image_url = meta.get("image_url")
-        if not image_url:
-            continue
-        try:
-            set_meta(p["id"], "status", "single_line_text_field", "processing")
-            glb = generate_glb_from_image(image_url)
-            res_url = staged_upload_glb("auto3d.glb", glb)
-            attach_model_media(p["id"], res_url)
-            set_meta(p["id"], "pending", "single_line_text_field", "0")
-            set_meta(p["id"], "status",  "single_line_text_field", "ready")
-            print("✅ Done:", p["title"])
-        except Exception as e:
-            print("❌ Error:", p["title"], e)
-            set_meta(p["id"], "status", "single_line_text_field", f"error:{str(e)[:120]}")
+def process_product(p):
+    pid = p["id"]
+    img = latest_image(p)
+    if not img: return False
+    fp = image_fingerprint(img)
+    already = state.get(pid, {}).get("last_fp")
+    if already == fp:
+        return False
+    if has_model3d(p):
+        # product already has a 3D model; record state so we don't touch it again
+        state[pid] = {"last_fp": fp, "status": "skipped_model_exists"}
+        save_state()
+        return False
+
+    print(f"→ Generating 3D for: {p['title']}")
+    try:
+        set_meta(pid, "status", "single_line_text_field", "processing")
+    except Exception:
+        pass
+
+    glb = meshy_generate_glb(img["url"])
+    res_url = staged_upload_glb("auto3d.glb", glb)
+    attach_model_media(pid, res_url)
+
+    state[pid] = {"last_fp": fp, "status": "ready"}
+    save_state()
+    try:
+        set_meta(pid, "status", "single_line_text_field", "ready")
+    except Exception:
+        pass
+    print(f"✅ Attached MODEL_3D: {p['title']}")
+    return True
 
 if __name__ == "__main__":
-    print("Polling… Ctrl+C to stop.")
+    print("Local poller running. Ctrl+C to stop.")
     while True:
         try:
-            work_once()
-            print("ran")
+            products = list_recent_products(limit=15)
+            for p in products:
+                process_product(p)
         except Exception as e:
             print("Loop error:", e)
-        time.sleep(5)
-
+        time.sleep(5)  # poll every 5 seconds
